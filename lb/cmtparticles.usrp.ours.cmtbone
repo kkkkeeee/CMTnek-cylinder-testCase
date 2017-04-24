@@ -1,0 +1,1378 @@
+c----------------------------------------------------------------------
+      subroutine stokes_particles
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CMTDATA'
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      integer icalld
+      save    icalld
+      data    icalld  /0/
+
+      if (istep.eq.0) then
+         call usr_particles_init
+      else
+         call usr_particles_solver
+      endif
+
+      if(mod(istep,iostep).eq.0.or.istep.eq.1) then
+         call usr_particles_io(istep)
+      endif
+      return
+      end
+c----------------------------------------------------------------------
+c     setup routines
+c----------------------------------------------------------------------
+      subroutine usr_particles_init
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CTIMER'
+      include 'CMTDATA'
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      nr = lr     ! Mandatory for proper striding
+      ni = li     ! Mandatory
+
+      call rzero(rpart,lr*lpart)
+      call izero(ipart,li*lpart)
+      call init_interpolation
+      call place_particles  ! n initialized here
+
+      return
+      end
+c----------------------------------------------------------------------
+      subroutine place_particles
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CMTDATA'
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+      common /elementload/ gfirst, inoassignd, resetFindpts, pload(lelg)
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+
+      real   xerange(2,3,lelt)
+      common /elementrange/ xerange
+      real   xdrange(2,3)
+      common /domainrange/ xdrange
+
+      integer nw
+      common /particlenumber/ nw
+      integer gfirst, inoassignd, resetFindpts, pload
+      integer nwe, remainder, i, ip, e, nl, k, npass, m
+      real    rho_p, dp, tau_p, mu_0
+      real cenPos(3)     !x0, y0, z0   ! central point for particles
+      real tempa, tempb, tempc, tempd
+      common /myparth/ i_fp_hndl, i_cr_hndl
+      logical partl
+
+      nl = 0
+      pi  = 4.0*atan(1.)
+
+      call set_part_pointers
+
+      rho_p     = 1130       ! kg/m^3, example particle density (steel)
+      mu_0      = 18.27E-6   ! Pa s, inital fluid viscosity
+      dp        = 1.92e-3 
+c     tau_p     = dp**2*rho_p/18.0d+0/mu_0
+      tau_p     = 1e-16      ! tracer if 1e-16
+
+      nw = param(72)   ! number of particles
+
+c      calculate # particles each processor should initialize
+       nwe = nw/np
+       remainder = mod(nw,np)
+       if(nid .lt. remainder) nwe = nwe + 1
+
+       print *, 'nid: ', nid, 'nwe: ', nwe
+       call srand(7086+nid*1000)
+        do i = 1, nwe
+           rpart(jx, i) = rand()
+           rpart(jy, i) = rand()
+           rpart(jz, i) = rand()
+           rpart(jar,i) = tau_p          ! Tracer? or is it 0?
+c         print *, 'particle i:', i, nid, rpart(jaa, i), rpart(jab, i), 
+c   >             rpart(jac, i), rpart(jad, i)            
+c        print *, 'particle i:', i, nid, rpart(jx, i), rpart(jy, i), 
+c    >             rpart(jz, i)
+        enddo
+      n = nwe
+     
+c     check if zstart and zlen is alright for a 2d case
+      if (.not. if3d) then
+          if (abs(zstart-1.0) .gt. 1E-16) then
+             write(6,*)'***particle zstart is not right for 2d case'
+             call exitt
+          elseif(abs(zlen) .gt. 1E-16) then
+             write(6,*)'***particle zlen is not right for 2d case'
+             call exitt
+         endif
+      endif
+
+      call update_particle_location(1)
+      call move_particles_inproc
+c     call particles_solver_nearest_neighbor
+      resetFindpts = 1
+      call reinitialize
+
+c     set local particle id
+      do i = 1, n
+         ipart(jpid2, i) = i
+      enddo
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine set_part_pointers
+      include 'SIZE'
+c     Minimal value of ni = 5
+c     Minimal value of nr = 16*ndim
+      common  /iparti/ n,nr,ni
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+      jrc = 1 ! Pointer to findpts return code
+      jpt = 2 ! Pointer to findpts return processor id
+      je0 = 3 ! Pointer to findpts return element id
+      jps = 4 ! Pointer to proc id for data swap
+      jpid1 = 5 ! initial proc number
+      jpid2 = 6 ! initial local particle id
+      jpid3 = 7 ! initial time step introduced
+      jpnn = 8 ! initial time step introduced
+      jpid = 9 ! initial time step introduced
+      jai = 10 ! Pointer to auxiliary integers
+      nai = ni - (jai-1)  ! Number of auxiliary integers
+      if (nai.le.0) call exitti('Error in nai:$',ni)
+
+      jr  = 1         ! Pointer to findpts return rst variables
+      jd  = jr + ndim ! Pointer to findpts return distance
+      jx  = jd + 1    ! Pointer to findpts input x value
+      jy  = jx + 1    ! Pointer to findpts input y value
+      jz  = jy + 1    ! Pointer to findpts input z value
+
+      jx1 = jx + ndim ! Pointer to xyz at t^{n-1}
+      jx2 = jx1+ ndim ! Pointer to xyz at t^{n-1}
+      jx3 = jx2+ ndim ! Pointer to xyz at t^{n-1}
+
+      jv0 = jx3+ ndim ! Pointer to current particle velocity
+      jv1 = jv0+ ndim ! Pointer to particle velocity at t^{n-1}
+      jv2 = jv1+ ndim ! Pointer to particle velocity at t^{n-2}
+      jv3 = jv2+ ndim ! Pointer to particle velocity at t^{n-3}
+
+      ju0 = jv3+ ndim ! Pointer to current fluid velocity
+      ju1 = ju0+ ndim ! Pointer to fluid velocity at t^{n-1}
+      ju2 = ju1+ ndim ! Pointer to fluid velocity at t^{n-2}
+      ju3 = ju2+ ndim ! Pointer to fluid velocity at t^{n-3}
+
+      jf0 = ju3+ ndim ! Pointer to forcing at current timestep
+
+      jar = jf0+ndim ! Pointer to auxiliary reals
+      jaa = jar + 1  ! for storing a as in x = x0 + at
+      jab = jaa + 1  ! for storing b as in x = x0 + bt
+      jac = jab + 1  ! for storing c as in x = x0 + ct
+      jad = jac + 1  ! for storing distance d on line from (X0, y0, z0)
+      nar = nr - (jad-1)  ! Number of auxiliary reals
+
+      if (nar.le.0) call exitti('Error in nar:$',nr)
+      return
+      end
+c----------------------------------------------------------------------
+c     particle force routines
+c----------------------------------------------------------------------
+      subroutine usr_particles_solver
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CMTDATA'
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+      real   xdrange(2,3)
+      common /domainrange/ xdrange
+
+      common /myparth/ i_fp_hndl, i_cr_hndl
+      common /myparts/ times(0:3),alpha(0:3),beta(0:3)
+      
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+
+      integer flagsend, flagreceive !used to inform all processor to stop when one particle move out of the domain
+      real s
+
+      jx0 = jx
+      flagsend = 0
+      flagreceive = 0
+
+      call particles_solver_forces
+      call get_bdf_ext_coefs(beta,alpha,times)
+
+c     Solve for velocity at time t^n
+      do j=0,ndim-1
+      do i=1,n
+         rpart(ju3+j,i)=rpart(ju2+j,i)
+         rpart(ju2+j,i)=rpart(ju1+j,i)
+         rpart(ju1+j,i)=rpart(ju0+j,i)
+         rpart(jv3+j,i)=rpart(jv2+j,i)
+         rpart(jv2+j,i)=rpart(jv1+j,i)
+         rpart(jv1+j,i)=rpart(jv0+j,i)
+         rpart(jx3+j,i)=rpart(jx2+j,i)
+         rpart(jx2+j,i)=rpart(jx1+j,i)
+         rpart(jx1+j,i)=rpart(jx0+j,i)
+      enddo
+      enddo
+
+      jst = jar ! Particle Stokes number = 1/tau
+      do i=1,n
+        s = rpart(jst,i)
+        do j=0,ndim-1
+          rhs = s*( alpha(1)*rpart(ju1+j,i)
+     $            + alpha(2)*rpart(ju2+j,i)
+     $            + alpha(3)*rpart(ju3+j,i)) + rpart(jf0+j,i)
+     $        +     beta (1)*rpart(jv1+j,i)
+     $        +     beta (2)*rpart(jv2+j,i)
+     $        +     beta (3)*rpart(jv3+j,i)
+          rpart(jv0+j,i) = rhs / (beta(0)+s) ! Implicit solve for v
+          rhx = beta (1)*rpart(jx1+j,i)
+     $        + beta (2)*rpart(jx2+j,i)
+     $        + beta (3)*rpart(jx3+j,i) + rpart(jv0+j,i)
+          !rpart(jx0+j,i) = rhx / beta(0)     ! Implicit solve for x, comment out by keke
+cc         print *, 'rpart(jx0+j, i):', rpart(jx0+j,i), 'nid: ', nid
+        enddo
+          rpart(jx, i) = rpart(jx, i) + (1.0/3)*rpart(jx, i)*DT
+          rpart(jy, i) = rpart(jy, i) 
+          rpart(jz, i) = rpart(jz, i)
+c          print *, 'nid: ', nid, 'i:', i, lglel(ipart(je0,i)+1), 
+c    $        rpart(jx, i), rpart(jy,i)
+      enddo
+      do i=1,n
+         if (rpart(jx,i) .gt. xdrange(2,1)) flagsend = flagsend + 1 
+         if (rpart(jx,i) .lt. xdrange(1,1)) flagsend = flagsend + 1
+         if (rpart(jy,i) .gt. xdrange(2,2)) flagsend = flagsend + 1
+         if (rpart(jy,i) .lt. xdrange(1,2)) flagsend = flagsend + 1
+         if (rpart(jz,i) .gt. xdrange(2,3)) flagsend = flagsend + 1
+         if (rpart(jz,i) .lt. xdrange(1,3)) flagsend = flagsend + 1
+      enddo
+
+      call igop (flagsend, flagreceive, '+  ', 1)
+      if (flagreceive .ne. 0) then
+         call exitt()
+      endif
+
+
+      call update_particle_location(1)
+      call move_particles_inproc
+c     call particles_solver_nearest_neighbor
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine particles_solver_nearest_neighbor
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CMTDATA'
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+      integer pdimc(3)
+
+      real   xerange(2,3,lelt)
+      common /elementrange/ xerange
+      real   xdrange(2,3)
+      common /domainrange/ xdrange
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+      common /myparth/ i_fp_hndl, i_cr_hndl
+
+      real               rfpts(lr,lpart),rtpts(lr,lpart)
+      integer            ifpts(li,lpart),fptsmap(lpart),itpts(lr,lpart)
+
+      logical partl         ! This is a dummy placeholder, used in cr()
+      real d2chk,pdist,pxyzg(3,7)
+      integer iitest(3), inpt(3,lpart), itest
+
+
+      nl = 0                ! No logicals exchanged
+      d2chk = 0.2 
+      d3    = 0.2 
+
+      nfpts = 0
+      ntpts = 0
+      do ip = 1,n
+         ipart(jai,ip) = ipart(jpnn,ip)
+
+
+         iitest(1) = 0
+         iitest(2) = 0
+         iitest(3) = 0
+         xloc = rpart(jx,ip)
+         yloc = rpart(jy,ip)
+         zloc = rpart(jz,ip)
+         iie = ipart(je0,ip) + 1
+
+         if (abs(xloc-xerange(1,1,iie)).lt. d2chk) iitest(1) = 1
+         if (abs(xloc-xerange(2,1,iie)).lt. d2chk) iitest(1) = 1 
+         if (abs(yloc-xerange(1,2,iie)).lt. d2chk) iitest(2) = 1 
+         if (abs(yloc-xerange(2,2,iie)).lt. d2chk) iitest(2) = 1 
+         if (abs(zloc-xerange(1,3,iie)).lt. d2chk) iitest(3) = 1 
+         if (abs(zloc-xerange(2,3,iie)).lt. d2chk) iitest(3) = 1
+
+         iic = 0
+
+         if (iitest(1) .eq. 1) then
+         if (iitest(2) .eq. 1) then
+         if (iitest(3) .eq. 1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc + sign(d2chk,rpart(jr,ip))
+            pxyzg(2,iic) = yloc + sign(d2chk,rpart(jr+1,ip))
+            pxyzg(3,iic) = zloc + sign(d2chk,rpart(jr+2,ip))
+         endif
+         endif
+         endif
+
+         if (iitest(1).eq.1) then
+         if (iitest(2).eq.1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc + sign(d2chk,rpart(jr,ip))
+            pxyzg(2,iic) = yloc + sign(d2chk,rpart(jr+1,ip))
+            pxyzg(3,iic) = zloc 
+         endif
+         endif
+
+         if (iitest(1).eq.1) then
+         if (iitest(3).eq.1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc + sign(d2chk,rpart(jr,ip))
+            pxyzg(2,iic) = yloc 
+            pxyzg(3,iic) = zloc + sign(d2chk,rpart(jr+2,ip))
+         endif
+         endif
+
+         if (iitest(2).eq.1) then
+         if (iitest(3).eq.1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc 
+            pxyzg(2,iic) = yloc + sign(d2chk,rpart(jr+1,ip))
+            pxyzg(3,iic) = zloc + sign(d2chk,rpart(jr+2,ip))
+         endif
+         endif
+
+         if (iitest(1).eq.1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc + sign(d2chk,rpart(jr,ip))
+            pxyzg(2,iic) = yloc
+            pxyzg(3,iic) = zloc
+         endif
+
+         if (iitest(2).eq.1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc 
+            pxyzg(2,iic) = yloc + sign(d2chk,rpart(jr+1,ip))
+            pxyzg(3,iic) = zloc
+         endif
+
+         if (iitest(3).eq.1) then
+            iic = iic + 1
+
+            pxyzg(1,iic) = xloc
+            pxyzg(2,iic) = yloc
+            pxyzg(3,iic) = zloc + sign(d2chk,rpart(jr+2,ip))
+         endif
+
+         do j= 1,iic
+            xxloc = pxyzg(1,j)
+            yyloc = pxyzg(2,j)
+            zzloc = pxyzg(3,j)
+            call bounds_p_check(xxloc,xdrange(1,1),xdrange(2,1),ifmovex)
+            call bounds_p_check(yyloc,xdrange(1,2),xdrange(2,2),ifmovey)
+            call bounds_p_check(zzloc,xdrange(1,3),xdrange(2,3),ifmovez)
+
+            nfpts = nfpts + 1
+            fptsmap(nfpts) = ip
+
+            call copy (rfpts(1,nfpts),rpart(1,ip),lr) 
+            call icopy(ifpts(1,nfpts),ipart(1,ip),li) 
+
+            rfpts(jx,nfpts) = xxloc
+            rfpts(jy,nfpts) = yyloc
+            rfpts(jz,nfpts) = zzloc
+
+            inpt(1,nfpts) = ifmovex
+            inpt(2,nfpts) = ifmovey
+            inpt(3,nfpts) = ifmovez
+         enddo
+      enddo
+
+      call findpts(i_fp_hndl !  stride     !   call findpts( ihndl,
+     $           , ifpts(jrc,1),li        !   $             rcode,1,
+     $           , ifpts(jpt,1),li        !   &             proc,1,
+     $           , ifpts(je0,1),li        !   &             elid,1,
+     $           , rfpts(jr ,1),lr        !   &             rst,ndim,
+     $           , rfpts(jd ,1),lr        !   &             dist,1,
+     $           , rfpts(jx ,1),lr        !   &             pts(    1),1,
+     $           , rfpts(jy ,1),lr        !   &             pts(  n+1),1,
+     $           , rfpts(jz ,1),lr ,nfpts)    !   &             pts(2*n+1),1,n)
+
+
+      jps = jpid1-1     ! Pointer to temporary proc id for swapping
+      print *, "in nearest neighbor, nfpts:", nfpts
+      do i=1,nfpts
+         ip = fptsmap(i)
+
+         if (inpt(1,i) .eq.0) rfpts(jx,i) = rpart(jx,ip)
+         if (inpt(2,i) .eq.0) rfpts(jy,i) = rpart(jy,ip)
+         if (inpt(3,i) .eq.0) rfpts(jz,i) = rpart(jz,ip)
+
+          if (inpt(1,i).eq.1) rfpts(jx,i) = rfpts(jx,i)  -
+     >          sign(d2chk,rpart(jr,ip))
+          if (inpt(2,i).eq.1) rfpts(jy,i) = rfpts(jy,i) -
+     >        sign(d2chk,rpart(jr+1,ip)) 
+          if (inpt(3,i).eq.1) rfpts(jz,i) = rfpts(jz,i) -
+     >        sign(d2chk,rpart(jr+2,ip))
+
+          ifpts(jpid,i) = 1
+          if (inpt(1,i)+inpt(2,i)+inpt(3,i).lt.0.9) then
+          if (ifpts(jpt,i) .eq. nid) then
+             ifpts(jpid,i) = -1   ! flag if should not search
+          endif
+          endif
+
+         ifpts(jps,i) = ifpts(jpt,i)
+      enddo
+
+
+c     Move particle info to the processor that owns each particle
+c     using crystal router in log P time:
+      call crystal_tuple_transfer(i_cr_hndl,nfpts,lpart
+     $           , ifpts,ni,partl,nl,rfpts,nr,jps)
+
+     
+c     now loop over all the particles on this element
+      do i = 1,n
+         nneigh = 0
+c        particles in local elements
+         do j = 1,n
+            if (i .ne. j) then
+               pdist = abs(rpart(jx,i)-rpart(jx,j))**2  
+     >                          + abs(rpart(jy,i)-rpart(jy,j))**2
+     >                          + abs(rpart(jz,i)-rpart(jz,j))**2
+               pdist = sqrt(pdist)
+               if (pdist .gt. d3) goto 1109
+               nneigh = nneigh + 1
+            endif
+1109        continue
+         enddo
+
+c        particles in different elements
+         do j = 1,nfpts
+            if( ifpts(jpid1,j).eq.ipart(jpid1,i)) then
+            if( ifpts(jpid2,j).eq.ipart(jpid2,i)) then
+            if( ifpts(jpid3,j).eq.ipart(jpid3,i)) then
+               goto 11092
+            endif
+            endif
+            endif
+            if (ifpts(jpid,j).gt. 0) then
+            if (ipart(je0,i) .eq. ifpts(je0,j)) then
+            pdist = abs(rpart(jx,i)-rfpts(jx,j))**2  
+     >                    + abs(rpart(jy,i)-rfpts(jy,j))**2
+     >                    + abs(rpart(jz,i)-rfpts(jz,j))**2
+            pdist = sqrt(pdist)
+            if (pdist .gt. d3) goto 11092
+            nneigh = nneigh + 1
+            endif
+            endif
+11092       continue
+         enddo
+         ipart(jpnn,i) = nneigh
+         ipart(jai,i) = ipart(jai,i) - ipart(jpnn,i)
+      enddo
+
+
+
+
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine bounds_p_check(xx,xl,xr,ifmove)
+      
+      ifmove = 0
+      if (xx .gt. xr) then
+         xx = abs(xx - xr) + xl
+         ifmove = 1
+      endif
+      if (xx .lt. xl) then
+         xx = xr - abs(xx - xl) 
+         ifmove = 1
+      endif
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine particles_solver_forces
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CMTDATA'
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+      real thet
+
+      pi  = 4.0*atan(1.)
+
+      do i=1,n
+        do j=0,ndim-1
+              rpart(jf0+j,i) = 0.0
+              thet = pi/4.0
+              if (j.eq.0) rpart(jf0+j,i) = 9.8*cos(thet)
+              if (j.eq.1) rpart(jf0+j,i) = 9.8*sin(thet)
+        enddo
+      enddo
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine get_bdf_ext_coefs(beta,alpha,times)
+      include 'SIZE'
+      include 'TOTAL'
+
+      real beta(0:3),alpha(0:3),times(0:3)
+      real c(0:8)
+
+      integer ilast,ncoef
+      save    ilast,ncoef
+      data    ilast,ncoef / -9 , 0 /
+
+      do i=3,1,-1
+         times(i)=times(i-1)
+      enddo
+      times(0) = time
+
+      call rzero(beta ,4)
+      call rzero(alpha,4)
+      if (istep.ne.ilast) then
+         ilast = istep
+         ncoef = ncoef + 1
+         ncoef = min(ncoef,3) ! Maximum 3rd order in time
+      endif
+      ncoefm1 = ncoef - 1
+
+      call fd_weights_full(times(0),times(1),ncoefm1,0,alpha(1))
+      call fd_weights_full(times(0),times(0),ncoef,1,c)
+      do j=0,ncoef
+         beta(j) = c(ncoef+1+j)
+      enddo
+      do j=1,ncoef
+         beta(j) = -beta(j)  ! Change sign, for convenience
+      enddo
+      return
+      end
+c----------------------------------------------------------------------
+      subroutine update_particle_location(bc_part)
+c     check if particles are outside domain
+c     > if bc_part = 1 then it is periodic
+c     > if bc_part = 0 then particles are killed
+      include 'SIZE'
+      include 'CMTDATA'
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+
+      real  xdrange(2,3) 
+      common /domainrange/ xdrange
+      integer bc_part,in_part(lpart), icount_p
+      real rtmp(lr,lpart)
+      integer itmp(li,lpart)
+
+      jx0 = jx
+      icount_p = 0
+
+
+      do i=1,n
+         in_part(i) = 0
+         do j=0,ndim-1
+            if (rpart(jx0+j,i).lt.xdrange(1,j+1))then
+               if (bc_part .eq. 1) then
+                  rpart(jx0+j,i) = xdrange(2,j+1) - 
+     &                             abs(xdrange(1,j+1) - rpart(jx0+j,i))
+                  rpart(jx1+j,i) = xdrange(2,j+1) +
+     &                             abs(xdrange(1,j+1) - rpart(jx1+j,i))
+                  rpart(jx2+j,i) = xdrange(2,j+1) +
+     &                             abs(xdrange(1,j+1) - rpart(jx2+j,i))
+                  rpart(jx3+j,i) = xdrange(2,j+1) +
+     &                             abs(xdrange(1,j+1) - rpart(jx3+j,i))
+               elseif (bc_part .eq. 0) then
+                  icount_p = icount_p + 1
+                  in_part(i) = -1
+               endif
+            endif
+            if (rpart(jx0+j,i).gt.xdrange(2,j+1))then
+               if (bc_part .eq. 1) then
+                  rpart(jx0+j,i) = xdrange(1,j+1) +
+     &                             abs(rpart(jx0+j,i) - xdrange(2,j+1))
+                  rpart(jx1+j,i) = xdrange(1,j+1) -
+     &                             abs(rpart(jx1+j,i) - xdrange(2,j+1))
+                  rpart(jx2+j,i) = xdrange(1,j+1) -
+     &                             abs(rpart(jx2+j,i) - xdrange(2,j+1))
+                  rpart(jx3+j,i) = xdrange(1,j+1) -
+     &                             abs(rpart(jx3+j,i) - xdrange(2,j+1))
+               elseif (bc_part .eq. 0) then
+                  if (in_part(i) .ne. -1) then
+                     icount_p = icount_p + 1
+                     in_part(i) = -1
+                  endif
+               endif
+            endif
+         enddo
+      enddo
+
+      if (icount_p .ne. 0) then
+
+      call rzero(rtmp,lr*lpart)
+      call izero(itmp,li*lpart)
+
+      nnew = n - icount_p
+      icount_p = 0
+      do i=1,n
+         if (in_part(i).ne.-1) then
+            icount_p = icount_p + 1
+            do j=1,lr
+               rtmp(j,icount_p) = rpart(j,i)
+            enddo
+            do j=1,li
+               itmp(j,icount_p) = ipart(j,i)
+            enddo
+         endif
+      enddo
+      call rzero(rpart,lr*n)
+      call izero(ipart,li*n)
+      n = nnew
+      call copy (rpart(1,1),rtmp(1,1),n*lr) 
+      call icopy(ipart(1,1),itmp(1,1),n*li) 
+      endif
+      return
+      end
+c-----------------------------------------------------------------------
+c     interpolation routines
+c-----------------------------------------------------------------------
+      subroutine init_interpolation
+      include 'SIZE' 
+      include 'INPUT' 
+c
+c     calculates the barycentric lagrange weights
+c
+      common /BARYPARAMS/ xgll, ygll, zgll, wxgll, wygll, wzgll
+      real xgll(lx1), ygll(ly1), zgll(lz1),
+     >     wxgll(lx1), wygll(ly1), wzgll(lz1)
+
+
+      pi  = 4.0*atan(1.)
+
+c     get gll points in all directions
+      call zwgll(xgll,wxgll,lx1)
+      call zwgll(ygll,wygll,ly1)
+      call rone(zgll,lz1)
+      if(if3d) call zwgll(zgll,wzgll,lz1)
+c     set all weights to ones first
+      call rone(wxgll,lx1)
+      call rone(wygll,ly1)
+      call rone(wzgll,lz1)
+c     calc x bary weights
+      do j=1,lx1
+         do k=1,lx1
+            if (j .NE. k) then
+               wxgll(j) = wxgll(j)/(xgll(j) - xgll(k))
+            endif
+         enddo
+      enddo
+c     calc y bary weights
+      do j=1,ly1
+         do k=1,ly1
+            if (j .NE. k) then
+               wygll(j) = wygll(j)/(ygll(j) - ygll(k))
+            endif
+         enddo
+      enddo
+c     calc z bary weights
+      do j=1,lz1
+         do k=1,lz1
+            if (j .NE. k) then
+               wzgll(j) = wzgll(j)/(zgll(j) - zgll(k))
+            endif
+         enddo
+      enddo
+      return 
+      end
+c-----------------------------------------------------------------------
+      subroutine init_baryinterp(x,y,z)
+c     used for 3d interpolation only
+      include 'SIZE'
+      common /BARYPARAMS/ xgll, ygll, zgll, wxgll, wygll, wzgll
+      real xgll(lx1), ygll(ly1), zgll(lz1),
+     >     wxgll(lx1), wygll(ly1), wzgll(lz1)
+      common /BARRYREP/ rep, bot
+      real              rep(lx1,ly1,lz1), bot
+
+      real x, y, z, repy, repz,repx,diff
+      real bwgtx(lx1),bwgty(ly1),bwgtz(lz1)
+c     main loop, but notice bwgtz, bwgtx, bwgty could be NaN if
+c     interpolated point is on a grid location. Need to fix, but
+c     is currently very robust. I THINK I fixed it......3/14/16 DZ
+      bot= 0.00
+      do k=1,nz1
+         diff = z - zgll(k)
+           if (abs(diff) .le. 1E-16) diff = sign(1E-16,diff)
+         bwgtz(k) = wzgll(k)/diff
+      enddo
+      do i=1,nx1
+         diff = x - xgll(i)
+           if (abs(diff) .le. 1E-16) diff = sign(1E-16,diff)
+         bwgtx(i) = wxgll(i)/diff
+      enddo 
+      do j=1,ny1
+         diff = y-ygll(j)
+           if (abs(diff) .le. 1E-16) diff = sign(1E-16,diff)
+         bwgty(j) = wygll(j)/diff
+      enddo
+      do k=1,nz1
+      do j=1,ny1
+         repdum = bwgty(j)*bwgtz(k)
+      do i=1,nx1
+         rep(i,j,k) =  repdum* bwgtx(i)
+         bot        =  bot + rep(i,j,k)
+      enddo
+      enddo
+      enddo 
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine baryinterp(field,pofx)
+c     used for 3d interpolation only
+      include 'SIZE'
+      common /BARRYREP/ rep, bot
+      real              rep(lx1,ly1,lz1), bot
+      real field(1),pofx,top
+
+      do i=1,nxyz
+         top =  top + rep(i,1,1)*field(i)
+      enddo
+      pofx = top/bot
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine interp_props_part_location
+      include 'SIZE'
+      include 'INPUT'
+      include 'SOLN'
+      include 'CMTDATA'
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      common /fundpart/ rhs_fluidp(lx1,ly1,lz1,ldim,lelt)
+     >                 ,lhs_density(lx1,ly1,lz1,lelt)
+      real rhs_fluidp,lhs_density
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+      common /BARRYREP/ rep, bot
+      real              rep(lx1,ly1,lz1), bot
+      nxyz = nx1*ny1*nz1
+        do i=1,n
+           rrdum = 1.0
+           if(if3d) rrdum = rpart(jr+2,i)
+           call init_baryinterp(rpart(jr,i),rpart(jr+1,i),rrdum)
+           ie  =  ipart(je0,i) + 1
+           call baryinterp(vx(1,1,1,ie),rpart(ju0,i))
+           call baryinterp(vy(1,1,1,ie),rpart(ju0+1,i))
+           if (if3d) call baryinterp(vz(1,1,1,ie),rpart(ju0+2,i))
+        enddo
+      return
+      end
+c----------------------------------------------------------------------
+c     particle input/output/ restart routines
+c----------------------------------------------------------------------
+      subroutine usr_particles_io(istep)
+      include 'SIZE'
+      include 'INPUT'
+      include 'mpif.h'
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+
+
+      common /nekmpi/ mid,np,nekcomm,nekgroup,nekreal
+
+      real x(ldim,lpart),partv(lpart)
+      common /scrns/ x_tmp(ldim+2,lpart),work(ldim+2,lpart)
+     $              ,v_tmp(ldim+1,lpart)
+      character*128 fname
+      character*15 locstring, velstring, datastring
+      integer oldfile, wdata_type, newfile
+      integer*8 disp
+      integer*8 extent_in_file, lb,extent
+      integer*8 stride_len , block_len
+      integer prevs(0:np-1)
+      integer npt_total
+      integer istep
+      logical ifexist
+      integer status_mpi(MPI_STATUS_SIZE)
+      real realtmp(4,lpart), vmag
+
+      integer icalld
+      save    icalld
+      data    icalld  /-1/
+
+c     setup files to write to -----------------------------------------
+      icalld = icalld+1
+      write(locstring,'(A7,I5.5,A3)') 'partxyz', icalld, '.3D' 
+      write(datastring,'(A8,I5.5)') 'partdata', icalld
+
+      do i = 1,n
+         realtmp(1,i) = rpart(jx,i)
+         realtmp(2,i) = rpart(jy,i)
+         realtmp(3,i) = rpart(jz,i)
+
+         vmag = rpart(jv0,i)**2 + rpart(jv0+1,i)**2
+         if (if3d) vmag = vmag + rpart(jv0+2,i)**2
+         vmag = sqrt(vmag)
+
+         realtmp(4,i) = real(ipart(jai,i))
+      enddo
+
+      call MPI_Send(n, 1, MPI_INTEGER, 0, 0, nekcomm, ierr)
+      npt_total = iglsum(n,1)
+
+c     write particle data to read into script
+      if (nid.eq. 0) then
+c         output data so files can be easily converted to binary
+          open(364, file=datastring, action="write")
+          write(364,*) npt_total
+          close(364)
+          prevs(0) = n
+          do i=1,np-1
+             call MPI_Recv(prevs(i),1,MPI_INTEGER,i,
+     >                     0,nekcomm,status_mpi,ierr)
+          enddo
+      endif
+      call MPI_BCAST(prevs,np, MPI_INTEGER,0,nekcomm,ierr) 
+
+      stride_len = 0.0
+      if (nid .ne. 0) then
+      do i=1,nid
+         stride_len = stride_len + prevs(i-1)
+      enddo
+      endif
+
+
+c     print out particle values -----------------------------------
+      call MPI_FILE_OPEN(nekcomm, locstring,
+     >                   MPI_MODE_CREATE + MPI_MODE_WRONLY, 
+     >                   MPI_INFO_NULL, oldfile, ierr) 
+
+      disp = stride_len*4*8
+      call MPI_FILE_SET_VIEW(oldfile, disp, MPI_DOUBLE_PRECISION,
+     >                       MPI_DOUBLE_PRECISION, "native", 
+     >                       MPI_INFO_NULL, ierr) 
+      call MPI_FILE_WRITE(oldfile, realtmp(1,1), n*4,
+     >                  MPI_DOUBLE_PRECISION,
+     >                  MPI_STATUS_IGNORE, ierr) 
+      call MPI_FILE_CLOSE(oldfile, ierr) 
+      do i =1,n
+         if (ipart(jpid1,i) .eq. 0) then   ! started on proc 0
+         if (ipart(jpid2,i) .eq. 5) then   ! id 5 at time 0
+         if (ipart(jpid3,i) .eq. 0) then   ! time 0
+            write(6, "(A3,I6,15F18.10,3I6)") 'PID',istep !2
+     >          ,rpart(jx,i)    !3
+     >          ,rpart(jy,i)    !4
+     >          ,rpart(jz,i)    !5
+     >          ,real(ipart(jpnn,i))
+         endif
+         endif
+         endif
+      enddo      
+
+      return
+      end
+
+c----------------------------------------------------------------------
+c     effeciently move particles between processors routines
+c----------------------------------------------------------------------
+      subroutine move_particles_inproc
+c     Interpolate fluid velocity at current xyz points and move
+c     data to the processor that owns the points.
+c     Input:    n = number of points on this processor
+c     Output:   n = number of points on this processor after the move
+c     Code checks for n > lpart and will not move data if there
+c     is insufficient room.
+      include 'SIZE'
+      include 'TOTAL'
+      include 'CTIMER'
+
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      common /nekmpi/ mid,mp,nekcomm,nekgroup,nekreal
+      common /myparth/ i_fp_hndl, i_cr_hndl
+
+      parameter (lrf=4+ldim,lif=5+5)
+      real               rfpts(lrf,lpart)
+      common /fptspartr/ rfpts
+      integer            ifpts(lif,lpart),fptsmap(lpart)
+      common /fptsparti/ ifpts,fptsmap
+
+      real   xerange(2,3,lelt)
+      common /elementrange/ xerange
+      real   xdrange(2,3)
+      common /domainrange/ xdrange
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+
+      common /elementload/ gfirst, inoassignd, resetFindpts, pload(lelg)
+      integer gfirst, inoassignd, resetFindpts, pload
+
+      integer icalld1
+      save    icalld1
+      data    icalld1 /0/
+
+      logical partl         ! This is a dummy placeholder, used in cr()
+      nl = 0                ! No logicals exchanged
+
+
+      if ((icalld1.eq.0) .or. (resetFindpts .eq. 1)) then
+         tolin = 1.e-12
+         if (wdsize.eq.4) tolin = 1.e-6
+         call intpts_setup  (tolin,i_fp_hndl)
+         call crystal_setup (i_cr_hndl,nekcomm,np)
+         icalld1 = icalld1 + 1
+         resetFindpts = 0
+c        added by keke
+         print *, 'before transfer nid: ', nid, '# particles: ', n
+c        end added by keke
+      endif
+
+      call particles_in_nid(fptsmap,rfpts,lrf,ifpts,lif,nfpts)
+
+      call findpts(i_fp_hndl !  stride     !   call findpts( ihndl,
+     $           , ifpts(jrc,1),lif        !   $             rcode,1,
+     $           , ifpts(jpt,1),lif        !   &             proc,1,
+     $           , ifpts(je0,1),lif        !   &             elid,1,
+     $           , rfpts(jr ,1),lrf        !   &             rst,ndim,
+     $           , rfpts(jd ,1),lrf        !   &             dist,1,
+     $           , rfpts(jx ,1),lrf        !   &             pts(    1),1,
+     $           , rfpts(jy ,1),lrf        !   &             pts(  n+1),1,
+     $           , rfpts(jz ,1),lrf ,nfpts)    !   &             pts(2*n+1),1,n)
+
+      nmax = iglmax(n,1)
+      if (nmax.gt.lpart) then
+         if (nid.eq.0) write(6,1) nmax,lpart
+    1    format('WARNING: Max number of particles:'
+     $   i9,'.  Not moving because lpart =',i9,'.')
+      else
+c        copy rfpts and ifpts back into their repsected positions in rpart and ipart
+         call update_findpts_info(rfpts,lrf
+     $                       ,ifpts,lif,fptsmap,nfpts)
+c        Move particle info to the processor that owns each particle
+c        using crystal router in log P time:
+
+         jps = jpid1-1     ! Pointer to temporary proc id for swapping
+         do i=1,n        ! Can't use jpt because it messes up particle info
+            ipart(jps,i) = ipart(jpt,i)
+         enddo
+         call crystal_tuple_transfer(i_cr_hndl,n,lpart
+     $              , ipart,ni,partl,nl,rpart,nr,jps)
+
+c        Sort by element number - for improved local-eval performance
+         call crystal_tuple_sort    (i_cr_hndl,n 
+     $              , ipart,ni,partl,nl,rpart,nr,je0,1)
+      endif
+
+
+c     Interpolate (locally, if data is resident).
+      call interp_props_part_location
+c        added by keke
+         print *, 'nid: ', nid, '# particles: ', n
+c        print *, 'xlimits: ', xdrange(1, 1), xdrange (2, 1)
+c        print *, 'ylimits: ', xdrange(1, 2), xdrange (2, 2)
+c        print *, 'zlimits: ', xdrange(1, 3), xdrange (2, 3)
+c        end added by keke
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine particles_in_nid(fptsmap,rfpts,nrf,ifpts,nif,nfpts)
+      include 'SIZE'
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      real    rfpts(nrf,*)
+      integer ifpts(nif,*),fptsmap(*)
+
+      real   xerange(2,3,lelt)
+      common /elementrange/ xerange
+
+      common /ptpointers/ jrc,jpt,je0,jps,jpid1,jpid2,jpid3,jpnn,jai
+     >               ,nai,jr,jd,jx,jy,jz,jx1,jx2,jx3,jv0,jv1,jv2,jv3
+     >               ,ju0,ju1,ju2,ju3,jf0,jar,jaa,jab,jac,jad,nar,jpid
+
+      nfpts = 0
+      do ip = 1,n
+         xloc = rpart(jx,ip)
+         yloc = rpart(jy,ip)
+         zloc = rpart(jz,ip)
+         itest = 0
+         do ie=1,nelt
+            if (xloc.ge.xerange(1,1,ie).and.xloc.le.xerange(2,1,ie))then
+            if (yloc.ge.xerange(1,2,ie).and.yloc.le.xerange(2,2,ie))then
+            if (zloc.ge.xerange(1,3,ie).and.zloc.le.xerange(2,3,ie))then
+                ipart(je0 ,ip) = ie-1
+                ipart(jrc ,ip) = 0
+                ipart(jpt ,ip) = nid
+                rpart(jd  ,ip) = 1.0 
+                rloc = -1.0 + 2.0*(xloc - xerange(1,1,ie))/
+     $                 (xerange(2,1,ie)-xerange(1,1,ie))
+                sloc = -1.0 + 2.0*(yloc - xerange(1,2,ie))/
+     $                 (xerange(2,2,ie)-xerange(1,2,ie))
+                tloc = -1.0 + 2.0*(zloc - xerange(1,3,ie))/
+     $                 (xerange(2,3,ie)-xerange(1,3,ie))
+                rpart(jr  ,ip) = rloc
+                rpart(jr+1,ip) = sloc
+                rpart(jr+2,ip) = tloc
+                itest = 1
+                goto 123
+            endif
+            endif
+            endif
+         enddo
+         if (itest.eq.0)then
+            nfpts = nfpts + 1
+            fptsmap(nfpts) = ip
+            call copy (rfpts(1,nfpts),rpart(1,ip),nrf) 
+            call icopy(ifpts(1,nfpts),ipart(1,ip),nif) 
+            if(nfpts.gt.lpart)then
+               write(6,*)'Too many points crossing over ',
+     $                      nfpts,lpart,nid
+               call exitt
+            endif
+         endif
+123      continue
+      enddo
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine update_findpts_info(rfpts,nrf
+     $                         ,ifpts,nif,fptsmap,nfpts)
+      include 'SIZE'
+      parameter (lr=16*ldim,li=5+6)
+      common  /cpartr/ rpart(lr,lpart) ! Minimal value of lr = 16*ndim+1
+      common  /cparti/ ipart(li,lpart) ! Minimal value of li = 5
+      common  /iparti/ n,nr,ni
+
+      real    rfpts(nrf,nfpts)
+      integer ifpts(nif,nfpts),fptsmap(nfpts)
+      do ifp = 1,nfpts
+         call copy(rpart(1,fptsmap(ifp)),rfpts(1,ifp),nrf)
+         call icopy(ipart(1,fptsmap(ifp)),ifpts(1,ifp),nif)
+      enddo
+      return
+      end
+c-----------------------------------------------------------------------
+c     outside routines
+c-----------------------------------------------------------------------
+      FUNCTION ran2(idum)
+      INTEGER idum,IM1,IM2,IMM1,IA1,IA2,IQ1,IQ2,IR1,IR2,NTAB,NDIV 
+      REAL ran2,AM,EPS,RNMX
+      PARAMETER (IM1=2147483563,IM2=2147483399,AM=1./IM1,IMM1=IM1-1,
+     $        IA1=40014,IA2=40692,IQ1=53668,IQ2=52774,IR1=12211,
+     $        IR2=3791,NTAB=32,NDIV=1+IMM1/NTAB,EPS=1.2e-7,RNMX=1.-EPS)
+c Long period (> 2 ! 1018 ) random number generator of L’Ecuyer with 
+c Bays-Durham shuffle and added safeguards. Returns a uniform random deviate 
+c between 0.0 and 1.0 (exclusive of the endpoint values). 
+c Call with idum a negative integer to initialize; thereafter, do not alter 
+c idum between successive deviates in a sequence. RNMX should approximate the 
+c largest floating value that is less than 1.
+      INTEGER idum2,j,k,iv(NTAB),iy
+      SAVE iv,iy,idum2
+      DATA idum2/123456789/, iv/NTAB*0/, iy/0/
+      if (idum.le.0) then 
+         idum1=max(-idum,1) 
+         idum2=idum1
+         do j=NTAB+8,1,-1
+            k=idum1/IQ1
+            idum1=IA1*(idum1-k*IQ1)-k*IR1 
+            if (idum1.lt.0) idum1=idum1+IM1 
+            if (j.le.NTAB) iv(j)=idum1
+         enddo
+         iy=iv(1) 
+      endif
+      k=idum1/IQ1 
+      idum1=IA1*(idum1-k*IQ1)-k*IR1
+      if (idum1.lt.0) idum1=idum1+IM1 
+      k=idum2/IQ2 
+      idum2=IA2*(idum2-k*IQ2)-k*IR2 
+      if (idum2.lt.0) idum2=idum2+IM2 
+      j=1+iy/NDIV
+      iy=iv(j)-idum2
+      iv(j)=idum1 
+      if(iy.lt.1)iy=iy+IMM1 
+      ran2=min(AM*iy,RNMX)
+      return
+      END
+c-----------------------------------------------------------------------
+      subroutine zufalli(seed)
+      implicit none
+c
+c  generates initial seed buffer by linear congruential
+c  method. Taken from Marsaglia, FSU report FSU-SCRI-87-50
+c  variable seed should be 0 < seed <31328
+c
+      integer seed
+      integer ptr
+      double precision s,t
+      double precision buff(607)
+      integer ij,kl,i,ii,j,jj,k,l,m
+      common /klotz0/buff,ptr
+      data ij/1802/,kl/9373/
+c
+      if(seed.ne.0) ij = seed
+c
+      i = mod(ij/177,177) + 2
+      j = mod(ij,177) + 2
+      k = mod(kl/169,178) + 1
+      l = mod(kl,169)
+      do 1 ii=1,607
+         s = 0.0
+         t = 0.5
+         do 2 jj=1,24
+            m = mod(mod(i*j,179)*k,179)
+            i = j
+            j = k
+            k = m
+            l = mod(53*l+1,169)
+            if(mod(l*m,64).ge.32) s = s+t
+            t = .5*t
+2        continue
+         buff(ii) = s
+1     continue
+      return
+      end
+c
+
+      subroutine zufall(n,a)
+      implicit none
+c
+c portable lagged Fibonacci series uniform random number
+c generator with "lags" -273 und -607:
+c
+c       t    = u(i-273)+buff(i-607)  (floating pt.)
+c       u(i) = t - float(int(t))
+c
+c W.P. Petersen, IPS, ETH Zuerich, 19 Mar. 92
+c
+      double precision a(*)
+      double precision buff(607)
+      double precision t
+      integer i,k,ptr,VL,k273,k607
+      integer buffsz,nn,n,left,q,qq
+      integer aptr,aptr0,bptr
+c
+      common /klotz0/buff,ptr
+      data buffsz/607/
+c
+      aptr = 0
+      nn   = n
+c
+1     continue
+c
+      if(nn .le. 0) return
+c
+c factor nn = q*607 + r
+c
+      q    = (nn-1)/607
+      left = buffsz - ptr
+c
+      if(q .le. 1) then
+c
+c only one or fewer full segments
+c
+         if(nn .lt. left) then
+            do 2 i=1,nn
+               a(i+aptr) = buff(ptr+i)
+2           continue
+            ptr  = ptr + nn
+            return
+         else
+            do 3 i=1,left
+               a(i+aptr) = buff(ptr+i)
+3           continue
+            ptr  = 0
+            aptr = aptr + left
+            nn   = nn - left
+c  buff -> buff case
+            VL   = 273
+            k273 = 334
+            k607 = 0
+            do 4 k=1,3
+cdir$ ivdep
+*vdir nodep
+*VOCL LOOP, TEMP(t), NOVREC(buff)
+               do 5 i=1,VL
+                  t            = buff(k273+i) + buff(k607+i)
+                  buff(k607+i) = t - float(int(t))
+5              continue
+               k607 = k607 + VL
+               k273 = k273 + VL
+               VL   = 167
+               if(k.eq.1) k273 = 0
+4           continue
+c
+            goto 1
+         endif
+      else
+c
+c more than 1 full segment
+c 
+          do 6 i=1,left
+             a(i+aptr) = buff(ptr+i)
+6         continue
+          nn   = nn - left
+          ptr  = 0
+          aptr = aptr+left
+c 
+c buff -> a(aptr0)
+c 
+          VL   = 273
+          k273 = 334
+          k607 = 0
+          do 7 k=1,3
+             if(k.eq.1)then
+*VOCL LOOP, TEMP(t)
+                do 8 i=1,VL
+                   t         = buff(k273+i) + buff(k607+i)
+                   a(aptr+i) = t - float(int(t))
+8               continue
+                k273 = aptr
+                k607 = k607 + VL
+                aptr = aptr + VL
+                VL   = 167
+             else
+cdir$ ivdep
+*vdir nodep
+*VOCL LOOP, TEMP(t)
+                do 9 i=1,VL
+                   t         = a(k273+i) + buff(k607+i)
+                   a(aptr+i) = t - float(int(t))
+9               continue
+                k607 = k607 + VL
+                k273 = k273 + VL
+                aptr = aptr + VL
+             endif
+7         continue
+          nn = nn - 607
+c
+c a(aptr-607) -> a(aptr) for last of the q-1 segments
+c
+          aptr0 = aptr - 607
+          VL    = 607
+c
+*vdir novector
+          do 10 qq=1,q-2
+             k273 = 334 + aptr0
+cdir$ ivdep
+*vdir nodep
+*VOCL LOOP, TEMP(t), NOVREC(a)
+             do 11 i=1,VL
+                t         = a(k273+i) + a(aptr0+i)
+                a(aptr+i) = t - float(int(t))
+11           continue
+             nn    = nn - 607
+             aptr  = aptr + VL
+             aptr0 = aptr0 + VL
+10        continue
+c
+c a(aptr0) -> buff, last segment before residual
+c
+          VL   = 273
+          k273 = 334 + aptr0
+          k607 = aptr0
+          bptr = 0
+          do 12 k=1,3
+             if(k.eq.1) then
+*VOCL LOOP, TEMP(t)
+                do 13 i=1,VL
+                   t            = a(k273+i) + a(k607+i)
+                   buff(bptr+i) = t - float(int(t))
+13              continue
+                k273 = 0
+                k607 = k607 + VL
+                bptr = bptr + VL
+                VL   = 167
+             else
+cdir$ ivdep
+*vdir nodep
+*VOCL LOOP, TEMP(t), NOVREC(buff)
+                do 14 i=1,VL
+                   t            = buff(k273+i) + a(k607+i)
+                   buff(bptr+i) = t - float(int(t))
+14              continue
+                k607 = k607 + VL
+                k273 = k273 + VL
+                bptr = bptr + VL
+             endif
+12        continue
+          goto 1
+      endif
+      end
