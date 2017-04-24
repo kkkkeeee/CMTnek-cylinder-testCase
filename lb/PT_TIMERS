@@ -1,0 +1,12 @@
+      real pt_timers(10), scrt_timers(10)
+      common /pt_timers/ pt_timers, scrt_timers
+      
+      parameter (IJINIT = 1,    ! initializaiton time
+     >           IJSOLV = 2,    ! solver time
+     >           IJOUTP = 3,    ! io time
+     >           IJCOMM = 4,    ! communication time
+     >           IJTOTL = 5,    ! total time
+     >           IJCOMO = 6,    ! old communication time
+     >           IJCOMN = 7,    ! new communication time
+     >           IJFLUI = 8)    ! total fluid solver time
+
