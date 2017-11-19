@@ -16,9 +16,9 @@ c
       parameter (lx2=lx1)       ! polynomial order for pressure
       parameter (lx1m=1)        ! polynomial order mesh solver; =1 no mesh motion
 
-      parameter (lelg=65536)     ! max total number of elements
-      parameter (lp=1024)       ! max number of MPI ranks
-      parameter (lelt=1024)       ! max number of elements per MPI rank 
+      parameter (lelg=5508)     ! max total number of elements
+      parameter (lp=1152)       ! max number of MPI ranks
+      parameter (lelt=100)       ! max number of elements per MPI rank 
       parameter (ldimt=4)       ! max number of auxiliary fields (temperature + scalars)
 
       ! OPTIONAL
@@ -35,6 +35,7 @@ c
       parameter (maxobj=4,maxmbr=lelt*6)        ! max number number of objects
       parameter (nsessmax=1,nmaxl=1,nfldmax=1,nmaxcom=1) ! multimesh parameters
 
-      parameter (llpart=5000000) ! max number of particles per mpi rank
+      parameter (llpart=380000) ! max number of particles per mpi rank
+
       ! INTERNALS
       include 'SIZE.inc'

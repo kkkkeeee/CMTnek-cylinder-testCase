@@ -4,31 +4,35 @@
 #-------------------------------------------------------------------------------
 
 # installation path 
-SOURCE_ROOT="/g/g90/zhai1/CMTnekLoadBalanceFromDavid/newest_particles/cylinder-lb-Nek5000"
-#SOURCE_ROOT="$HOME/CMTnekLoadBalance/Nek5000" 
+#SOURCE_ROOT="/g/g90/zhai1/Davidsend/send-5.10/loadBal-Nek5000-copytry"
+SOURCE_ROOT="/g/g90/zhai1/Jasonsend/loadBal-Nek5000-copytry"
+#SOURCE_ROOT="/g/g90/zhai1/reduceReinit901/loadBal-Nek5000"
 
 # Fortran/C compiler
-F77="mpixlf77"
-CC="mpixlc"
+#F77="mpixlf77"
+#CC="mpixlc"
+F77="mpifort"
+CC="mpicc"
 
 # pre-processor list (set to "?" to get a list of available symbols)
-PPLIST="CMTNEK" 
+PPLIST="CMTNEK MPIIO" 
 
 # generic compiler flags
 #G="-g"
 
 # linking flags
 #USR_LFLAGS="-L/usr/lib -lfoo"
+#USR_LFLAGS="-I/usr/local/tools/essl/5.1/include -L/usr/local/tools/essl/5.1/lib -lesslbg"
 
 ###############################################################################
 # WHAT FOLLOWS ARE OPTIONAL SETTINGS
 ###############################################################################
 
 # MPI (default true)
-#IFMPI="false"
+# IFMPI="false"
 
 # profiling (default false)
-IFPROFILING="true"
+# IFPROFILING="true"
 
 # auxilliary files to compile
 # NOTE: source files have to located in the same directory as makenek
